@@ -666,6 +666,10 @@ fn install_version(
     if let Some(dir) = target.parent() {
         fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
+    #[cfg(target_os = "android")]
+    if project.kind == Kind::Mod {
+        horizon_mods::authorization::revoke(home, &p.id).map_err(|e| e.to_string())?;
+    }
     fs::rename(&path, &target).map_err(|e| format!("{}: {e}", target.display()))?;
     if let Some(old) = old
         .as_ref()
@@ -673,7 +677,7 @@ fn install_version(
     {
         let _ = fs::remove_file(home.join(&old.file));
     }
-    if project.kind == Kind::Mod {
+    if project.kind == Kind::Mod && !cfg!(target_os = "android") {
         java::set_enabled(home, &p.id, true)?;
     }
     let entry = installed::Entry {

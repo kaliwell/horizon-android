@@ -13,7 +13,8 @@ use zip::{CompressionMethod, ZipArchive};
 
 /// The most one entry inflates to: far above any real pack file, but a zip
 /// bomb stops here.
-const MAX_ENTRY: usize = 1 << 30;
+const MAX_ENTRY: usize = 64 << 20;
+const MAX_METADATA: usize = 1 << 20;
 
 /// One archive with its entries indexed by name (`\` read as `/`), files
 /// and folders apart.
@@ -22,8 +23,6 @@ pub struct Zip {
     entries: BTreeMap<String, usize>,
     /// Folder entries (`name/`) by their name without the slash.
     folders: BTreeMap<String, usize>,
-    /// The archive's length: no size an entry claims can be bigger.
-    len: usize,
 }
 fn invalid(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
@@ -126,7 +125,6 @@ impl Zip {
         })
     }
     fn new(reader: Reader) -> io::Result<Self> {
-        let len = (reader.tail_at + reader.tail.len() as u64) as usize;
         let archive = ZipArchive::new(reader).map_err(invalid)?;
         let (mut entries, mut folders) = (BTreeMap::new(), BTreeMap::new());
         for i in 0..archive.len() {
@@ -143,7 +141,6 @@ impl Zip {
             archive,
             entries,
             folders,
-            len,
         })
     }
     /// The central directory on, as read at opening: every entry's name, sizes
@@ -169,6 +166,18 @@ impl Zip {
         self.index(name).is_some()
     }
     pub fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        self.read_limited(
+            name,
+            if name == "pack.mcmeta" {
+                MAX_METADATA
+            } else {
+                MAX_ENTRY
+            },
+        )
+    }
+    /// Bound actual output, including stored entries and archives with inaccurate sizes.
+    pub fn read_limited(&self, name: &str, limit: usize) -> io::Result<Vec<u8>> {
+        let limit = limit.min(MAX_ENTRY);
         let index = self
             .index(name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, name.to_owned()))?;
@@ -177,8 +186,22 @@ impl Zip {
         let mut archive = self.archive.clone();
         let mut entry = archive.by_index_raw(index).map_err(invalid)?;
         let method = entry.compression();
-        let mut raw = Vec::with_capacity((entry.compressed_size() as usize).min(self.len));
-        entry.read_to_end(&mut raw)?;
+        // A bounded compressed buffer also avoids allocating from attacker-controlled sizes.
+        let raw_limit = if method == CompressionMethod::Stored {
+            limit
+        } else {
+            // Leave room for DEFLATE overhead, while keeping tiny metadata
+            // from consuming the general asset budget before inflation starts.
+            limit.saturating_add(64 << 10).min(MAX_ENTRY)
+        };
+        let mut raw = Vec::new();
+        entry
+            .by_ref()
+            .take(raw_limit as u64 + 1)
+            .read_to_end(&mut raw)?;
+        if raw.len() > raw_limit {
+            return Err(invalid("entry exceeds the size limit"));
+        }
         match method {
             CompressionMethod::Stored => Ok(raw),
             CompressionMethod::Deflated => {
@@ -191,12 +214,12 @@ impl Zip {
                 // deflate stream" and with them the whole pack. Only the
                 // size limit stands between the archive and a zip bomb.
                 let decoder = flate2::read::DeflateDecoder::new(raw.as_slice());
-                let mut decoded = Vec::with_capacity(raw.len().min(MAX_ENTRY));
+                let mut decoded = Vec::new();
                 decoder
-                    .take(MAX_ENTRY as u64 + 1)
+                    .take(limit as u64 + 1)
                     .read_to_end(&mut decoded)
                     .map_err(|_| invalid("corrupt deflate stream"))?;
-                if decoded.len() > MAX_ENTRY {
+                if decoded.len() > limit {
                     return Err(invalid("entry inflates past the size limit"));
                 }
                 Ok(decoded)
@@ -266,6 +289,33 @@ fn normalize_end(data: &mut [u8]) {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    #[test]
+    fn metadata_bombs_fail_for_stored_and_deflated_entries() {
+        let mut body = b"{\"pack\":{}}".to_vec();
+        body.resize(MAX_METADATA + 1, b' ');
+        for compressed in [false, true] {
+            let bytes = archive_of(&[("pack.mcmeta", &body, compressed)]);
+            let zip = Zip::from_bytes(bytes).unwrap();
+            assert_eq!(
+                zip.read("pack.mcmeta").unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+    #[test]
+    fn entry_budget_checks_actual_output_and_accepts_exact_boundary() {
+        for compressed in [false, true] {
+            let zip = Zip::from_bytes(archive_of(&[("asset", b"12345", compressed)])).unwrap();
+            assert!(zip.read_limited("asset", 4).is_err());
+            assert_eq!(zip.read_limited("asset", 5).unwrap(), b"12345");
+        }
+        // Java-compatible reads ignore declared inflated sizes; budget must still hold.
+        let mut bytes = archive_of(&[("pack.mcmeta", &[b' '; 128], true)]);
+        let central = bytes.windows(4).position(|v| v == b"PK\x01\x02").unwrap();
+        bytes[central + 24..central + 28].copy_from_slice(&1u32.to_le_bytes());
+        let zip = Zip::from_bytes(bytes).unwrap();
+        assert!(zip.read_limited("pack.mcmeta", 64).is_err());
+    }
     /// `bytes` as a file and opened, the file removed again where the system lets it.
     fn opened(test: &str, bytes: &[u8]) -> io::Result<Zip> {
         let path =

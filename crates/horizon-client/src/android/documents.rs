@@ -267,6 +267,13 @@ fn stage(request: Request, mut input: std::fs::File, name: String) -> Result<()>
                 false,
             );
         } else {
+            if request.kind == Kind::Mods {
+                let id = target
+                    .file_stem()
+                    .and_then(|v| v.to_str())
+                    .ok_or("Invalid mod ID")?;
+                horizon_mods::authorization::revoke(&request.home, id)?;
+            }
             std::fs::rename(&staged, &target)?;
             imported(
                 format!(
@@ -341,6 +348,19 @@ pub fn resolve(choice: Choice) {
                     return Err("Too many filename conflicts".into());
                 }
             }
+        }
+        if c.kind == Kind::Mods {
+            let id = c
+                .target
+                .file_stem()
+                .and_then(|v| v.to_str())
+                .ok_or("Invalid mod ID")?;
+            let home = c
+                .target
+                .parent()
+                .and_then(|v| v.parent())
+                .ok_or("Invalid mod folder")?;
+            horizon_mods::authorization::revoke(home, id)?;
         }
         std::fs::rename(&c.staged, &c.target)?;
         Ok(())

@@ -5,6 +5,13 @@ import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.CancellationSignal;
 import android.os.ParcelFileDescriptor;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.ProxyFileDescriptorCallback;
+import android.os.storage.StorageManager;
+import android.system.ErrnoException;
+import android.system.Os;
+import android.system.OsConstants;
 import android.provider.DocumentsContract;
 import android.provider.DocumentsProvider;
 import java.io.FileNotFoundException;
@@ -24,6 +31,35 @@ public final class HorizonDocumentsProvider extends DocumentsProvider {
             throws FileNotFoundException;
     private static native int nativeOpen(String home, String id, String mode)
             throws FileNotFoundException;
+    private static native void nativeReleaseWorldLease();
+    private static final HandlerThread TRANSFERS = new HandlerThread("Horizon world transfers");
+    static { TRANSFERS.start(); }
+
+    /** Keep the world lease until the recipient's last proxy descriptor is closed. */
+    private static final class WorldFile extends ProxyFileDescriptorCallback {
+        private final ParcelFileDescriptor file;
+        private final java.util.concurrent.atomic.AtomicBoolean released = new java.util.concurrent.atomic.AtomicBoolean();
+        WorldFile(ParcelFileDescriptor file) { this.file = file; }
+        @Override public long onGetSize() throws ErrnoException {
+            return Os.fstat(file.getFileDescriptor()).st_size;
+        }
+        @Override public int onRead(long offset, int size, byte[] data) throws ErrnoException {
+            try { return Os.pread(file.getFileDescriptor(), data, 0, size, offset); }
+            catch (java.io.InterruptedIOException e) { throw new ErrnoException("read", OsConstants.EINTR); }
+        }
+        @Override public int onWrite(long offset, int size, byte[] data) throws ErrnoException {
+            try { return Os.pwrite(file.getFileDescriptor(), data, 0, size, offset); }
+            catch (java.io.InterruptedIOException e) { throw new ErrnoException("write", OsConstants.EINTR); }
+        }
+        @Override public void onFsync() throws ErrnoException { Os.fsync(file.getFileDescriptor()); }
+        @Override public void onRelease() {
+            if (released.compareAndSet(false, true)) {
+                try { file.close(); }
+                catch (java.io.IOException ignored) {}
+                finally { nativeReleaseWorldLease(); }
+            }
+        }
+    }
 
     @Override public boolean onCreate() {
         System.loadLibrary("horizon_android");
@@ -94,8 +130,19 @@ public final class HorizonDocumentsProvider extends DocumentsProvider {
     @Override public ParcelFileDescriptor openDocument(String id, String mode, CancellationSignal signal)
             throws FileNotFoundException {
         if (signal != null) signal.throwIfCanceled();
-        return ParcelFileDescriptor.adoptFd(nativeOpen(
+        ParcelFileDescriptor file = ParcelFileDescriptor.adoptFd(nativeOpen(
                 getContext().getFilesDir().getAbsolutePath(), id, mode));
+        String[] parts = id.split("/");
+        if (parts.length < 2 || !"worlds".equals(parts[1])) return file;
+        WorldFile callback = new WorldFile(file);
+        try {
+            StorageManager storage = getContext().getSystemService(StorageManager.class);
+            int access = ParcelFileDescriptor.parseMode(mode) & ParcelFileDescriptor.MODE_READ_WRITE;
+            return storage.openProxyFileDescriptor(access, callback, new Handler(TRANSFERS.getLooper()));
+        } catch (java.io.IOException | RuntimeException error) {
+            callback.onRelease();
+            throw new FileNotFoundException("Could not open world transfer");
+        }
     }
     @Override public String createDocument(String parent, String mime, String name)
             throws FileNotFoundException {

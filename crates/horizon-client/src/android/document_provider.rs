@@ -74,11 +74,14 @@ extern "system" fn Java_dev_horizon_android_HorizonDocumentsProvider_nativeOpen(
         let home = PathBuf::from(text(&mut env, &home)?);
         let id = text(&mut env, &id)?;
         let mode = text(&mut env, &mode)?;
+        let lease = document_store::world_access(&id).map_err(|e| e.to_string())?;
         let file = document_store::open(&home, &id, &mode).map_err(|e| e.to_string())?;
         if mode != "r" {
             CHANGED.store(true, Ordering::Relaxed);
         }
-        Ok::<_, String>(file.into_raw_fd())
+        let fd = file.into_raw_fd();
+        lease.detach();
+        Ok::<_, String>(fd)
     }))
     .unwrap_or_else(|_| Err("Horizon document open failed".into()));
     match result {
@@ -88,4 +91,12 @@ extern "system" fn Java_dev_horizon_android_HorizonDocumentsProvider_nativeOpen(
             -1
         }
     }
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_dev_horizon_android_HorizonDocumentsProvider_nativeReleaseWorldLease(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) {
+    document_store::release_world_lease();
 }

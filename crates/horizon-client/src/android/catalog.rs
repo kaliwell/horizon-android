@@ -499,6 +499,7 @@ impl Catalog {
             let result=(||{
                 let package=horizon_mods::Package::read(&stage)?;
                 let destination=dir.join(format!("{}.hmod",package.manifest.id));
+                horizon_mods::authorization::revoke(&game,&package.manifest.id).map_err(|e|e.to_string())?;
                 if destination.exists(){std::fs::copy(&destination,destination.with_extension("hmod.previous")).map_err(|e|e.to_string())?;}
                 std::fs::rename(&stage,destination).map_err(|e|e.to_string())?;
                 Ok(Reply::Done(format!("Installed {}. Enable it in Installed after reviewing its capabilities in game Mods.",package.manifest.name), horizon_client::content_files::Kind::Mods))

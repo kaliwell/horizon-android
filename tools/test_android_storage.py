@@ -98,6 +98,7 @@ name = "horizon_android"
 crate-type = ["cdylib"]
 [workspace]
 [dependencies]
+horizon-mods = { path = "../../../crates/horizon-mods", default-features = false }
 jni = "0.21"
 serde_json = "1"
 rustix = { version = "1", features = ["fs"] }

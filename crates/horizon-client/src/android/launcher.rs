@@ -124,7 +124,7 @@ impl Launcher {
             drop(game);
         }
         crate::game::android_reset_bundled_mods();
-        crate::document_store::set_game_active(false);
+        let _ = crate::document_store::set_game_active(false);
         crate::performance::stop();
         crate::platform::hide();
         horizon_client::auth::clear_current();
@@ -353,11 +353,14 @@ impl Launcher {
                 open_gl: self.catalog.config.renderer == crate::catalog::RendererMode::OpenGl,
                 gpu_batching: self.catalog.config.renderer == crate::catalog::RendererMode::Vulkan,
             };
-            crate::document_store::set_game_active(true);
+            if let Err(error) = crate::document_store::set_game_active(true) {
+                crate::performance::stop();
+                return Err(error.into());
+            }
             let game = match crate::game_launch::start(request) {
                 Ok(game) => game,
                 Err(error) => {
-                    crate::document_store::set_game_active(false);
+                    let _ = crate::document_store::set_game_active(false);
                     crate::performance::stop();
                     return Err(error);
                 }

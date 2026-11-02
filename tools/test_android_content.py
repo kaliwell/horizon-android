@@ -16,6 +16,7 @@ version = "0.0.0"
 edition = "2024"
 [workspace]
 [dependencies]
+jni = "0.21"
 horizon-mods = { path = "../../../crates/horizon-mods", default-features = false }
 serde_json = "1"
 sha2 = "0.10"
@@ -33,11 +34,13 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 mod osk { pub enum Output { Text(String), Backspace, Enter, Close } }
 #[path = "../../../../crates/horizon-client/src/ime_edit.rs"] mod ime_edit;
 #[path = "../../../../crates/horizon-client/src/content_files.rs"] mod content_files;
+#[path = "../../../../crates/horizon-mods/src/authorization.rs"] mod mod_authorization;
 #[path = "../../../../crates/horizon-client/src/official_install_cache.rs"] mod official_install_cache;
 #[path = "../../../../crates/horizon-client-render/src/gfx/upload_budget.rs"] mod upload_budget;
 #[path = "../../../../crates/horizon-client-render/src/zip.rs"] mod archive_reader;
 #[path = "../../../../crates/horizon-client/src/android/search_queue.rs"] mod search_queue;
 #[path = "../../../../crates/horizon-client/src/android/document_store.rs"] mod document_store;
+#[path = "../../../../crates/horizon-client/src/android/document_provider.rs"] mod document_provider;
 #[path = "../../../../crates/horizon-client-render/src/graphics_startup.rs"] mod graphics_startup;
 #[path = "../../../../crates/horizon-client/src/android_resources.rs"] mod android_resources;
 #[path = "../../../../crates/horizon-client/src/ui_text.rs"] mod ui_text;

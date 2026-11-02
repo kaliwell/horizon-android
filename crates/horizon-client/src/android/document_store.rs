@@ -9,20 +9,57 @@ use std::{
 pub const ROOT: &str = "horizon";
 const DIRECTORY: &str = "vnd.android.document/directory";
 const MAX_CHILDREN: usize = 32768;
-static GAME_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-pub fn set_game_active(active: bool) {
-    GAME_ACTIVE.store(active, std::sync::atomic::Ordering::Release);
+#[derive(Default)]
+struct WorldAccess {
+    active: bool,
+    transfers: usize,
 }
-fn world_access(id: &str) -> io::Result<()> {
-    if id.split('/').nth(1) == Some("worlds")
-        && GAME_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
-    {
+static WORLD_ACCESS: std::sync::Mutex<WorldAccess> = std::sync::Mutex::new(WorldAccess {
+    active: false,
+    transfers: 0,
+});
+pub fn set_game_active(active: bool) -> io::Result<()> {
+    let mut access = WORLD_ACCESS.lock().unwrap_or_else(|e| e.into_inner());
+    if active && access.transfers != 0 {
+        return Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            "Finish the world file transfer in Files before starting the game",
+        ));
+    }
+    access.active = active;
+    Ok(())
+}
+/// Retained until the external proxy FD closes, not merely until open() returns.
+pub struct WorldLease(bool);
+impl WorldLease {
+    pub fn detach(self) {
+        std::mem::forget(self);
+    }
+}
+impl Drop for WorldLease {
+    fn drop(&mut self) {
+        if self.0 {
+            release_world_lease();
+        }
+    }
+}
+pub fn release_world_lease() {
+    let mut access = WORLD_ACCESS.lock().unwrap_or_else(|e| e.into_inner());
+    access.transfers = access.transfers.saturating_sub(1);
+}
+pub fn world_access(id: &str) -> io::Result<WorldLease> {
+    if id.split('/').nth(1) != Some("worlds") {
+        return Ok(WorldLease(false));
+    }
+    let mut access = WORLD_ACCESS.lock().unwrap_or_else(|e| e.into_inner());
+    if access.active {
         return Err(io::Error::new(
             ErrorKind::PermissionDenied,
             "Return to the launcher before copying or editing worlds",
         ));
     }
-    Ok(())
+    access.transfers += 1;
+    Ok(WorldLease(true))
 }
 
 fn invalid() -> io::Error {
@@ -39,6 +76,17 @@ fn component(name: &str) -> io::Result<()> {
         return Err(invalid());
     }
     Ok(())
+}
+
+fn revoke_mods(home: &Path, id: &str) -> io::Result<()> {
+    let mut parts = id.split('/');
+    let profile = parts.next().ok_or_else(invalid)?;
+    if parts.next() != Some("mods") {
+        return Ok(());
+    }
+    // Resolve first, including canonical profile IDs and symlink rejection.
+    let doc = resolve(home, &format!("{profile}/mods"))?;
+    horizon_mods::authorization::revoke_all(doc.path.parent().ok_or_else(invalid)?)
 }
 
 pub fn folder_id(profile: u32, folder: &str) -> String {
@@ -184,7 +232,7 @@ pub fn children(home: &Path, id: &str) -> io::Result<Vec<Value>> {
             .map(|folder| row(home, &folder_id(profile(home), folder)))
             .collect();
     }
-    world_access(id)?;
+    let _access = world_access(id)?;
     let doc = resolve(home, id)?;
     let mut result = Vec::new();
     for (index, entry) in fs::read_dir(doc.path)?.enumerate() {
@@ -223,10 +271,13 @@ pub fn is_child(home: &Path, parent: &str, child: &str) -> bool {
                     .is_some_and(|rest| rest.starts_with('/'))))
 }
 pub fn open(home: &Path, id: &str, mode: &str) -> io::Result<File> {
-    world_access(id)?;
+    let _access = world_access(id)?;
     let doc = resolve(home, id)?;
     if !fs::metadata(&doc.path)?.is_file() || (doc.reports && mode != "r") {
         return Err(invalid());
+    }
+    if mode != "r" {
+        revoke_mods(home, id)?;
     }
     let mut options = OpenOptions::new();
     match mode {
@@ -250,9 +301,11 @@ pub fn open(home: &Path, id: &str, mode: &str) -> io::Result<File> {
     options.open(doc.path)
 }
 pub fn call(home: &Path, op: &str, id: &str, arg: &str) -> io::Result<Value> {
-    if !matches!(op, "document" | "path" | "child") {
-        world_access(id)?;
-    }
+    let _access = if !matches!(op, "document" | "path" | "child") {
+        Some(world_access(id)?)
+    } else {
+        None
+    };
     match op {
         "roots" => Ok(json!([{"root_id": ROOT, "document_id": ROOT,
             "title": "Horizon Android", "flags": 18, "mime_types": "*/*"}])),
@@ -289,6 +342,7 @@ pub fn call(home: &Path, op: &str, id: &str, arg: &str) -> io::Result<Value> {
             if parent.reports || !parent.path.is_dir() {
                 return Err(invalid());
             }
+            revoke_mods(home, id)?;
             // create_new never overwrites a name. Let DocumentsUI request another name.
             let child = format!("{id}/{arg}");
             let target = resolve(home, &child)?;
@@ -307,6 +361,7 @@ pub fn call(home: &Path, op: &str, id: &str, arg: &str) -> io::Result<Value> {
             if doc.label.is_some() || doc.reports {
                 return Err(invalid());
             }
+            revoke_mods(home, id)?;
             if op == "delete" {
                 // Nonempty directories must be emptied by the client explicitly.
                 if doc.path.is_dir() {
@@ -421,6 +476,23 @@ mod tests {
             assert!(resolve(&home, "p0/mods/link/report.jsonl").is_err());
             assert!(!is_child(&home, ROOT, "p0/mods/link/report.jsonl"));
         }
+        fs::write(
+            home.join("horizon-mods.txt"),
+            "mod.old:true\nmod.other:true\n",
+        )
+        .unwrap();
+        let profile7 = home.join("profiles/profile-7");
+        fs::write(profile7.join("horizon-mods.txt"), "mod.other:true\n").unwrap();
+        drop(open(&home, "p0/mods/test.hmod", "rw").unwrap());
+        assert!(
+            !fs::read_to_string(home.join("horizon-mods.txt"))
+                .unwrap()
+                .contains(":true")
+        );
+        assert_eq!(
+            fs::read_to_string(profile7.join("horizon-mods.txt")).unwrap(),
+            "mod.other:true\n"
+        );
         fs::remove_dir_all(home).unwrap();
     }
 }
@@ -447,13 +519,32 @@ mod world_tests {
             .read_to_end(&mut data)
             .unwrap();
         assert_eq!(data, b"fixture");
-        set_game_active(true);
+        set_game_active(true).unwrap();
         let blocked = open(&home, "p0/worlds/Example/level.dat", "r").is_err()
             && call(&home, "delete", "p0/worlds/Example/level.dat", "").is_err()
             && children(&home, "p0/worlds").is_err();
-        set_game_active(false);
+        set_game_active(false).unwrap();
         assert!(blocked);
         assert!(open(&home, "p0/worlds/Example/level.dat", "r").is_ok());
+        let lease = world_access("p0/worlds/Example/level.dat").unwrap();
+        let mut held = open(&home, "p0/worlds/Example/level.dat", "rw").unwrap();
+        assert_eq!(
+            set_game_active(true).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        held.write_all(b"transfer").unwrap();
+        drop(held);
+        drop(lease);
+        set_game_active(true).unwrap();
+        assert!(world_access("p0/worlds/Example/level.dat").is_err());
+        assert!(world_access("p0/mods/fixture.hmod").is_ok());
+        set_game_active(false).unwrap();
+        let lease = world_access("p0/worlds/Example/level.dat").unwrap();
+        lease.detach();
+        assert!(set_game_active(true).is_err());
+        release_world_lease();
+        set_game_active(true).unwrap();
+        set_game_active(false).unwrap();
         fs::remove_dir_all(home).unwrap();
     }
 }
